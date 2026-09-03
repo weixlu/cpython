@@ -21,6 +21,7 @@
 #include "pycore_brc.h"         // struct _brc_thread_state
 #include "pycore_ceval.h"       // _Py_set_eval_breaker_bit
 #include "pycore_llist.h"       // struct llist_node
+#include "pycore_parking_lot.h" // _PyParkingLot_UnparkAll
 #include "pycore_pystate.h"     // _PyThreadStateImpl
 
 #ifdef Py_GIL_DISABLED
@@ -48,6 +49,31 @@ find_thread_state(struct _brc_bucket *bucket, uintptr_t thread_id)
     return NULL;
 }
 
+static bool
+borrow_detached_thread(PyThreadState *owner)
+{
+    // In most cases the CAS fails because the owner thread is running, so do
+    // a relaxed load first to keep the fast path cheap.
+    if (_Py_atomic_load_int_relaxed(&owner->state) != _Py_THREAD_DETACHED) {
+        return false;
+    }
+    int expected = _Py_THREAD_DETACHED;
+    return _Py_atomic_compare_exchange_int(&owner->state, &expected,
+                                           _Py_THREAD_SUSPENDED);
+}
+
+static void
+release_borrowed_thread(PyThreadState *owner)
+{
+    // Use a CAS rather than a plain store: the interpreter may concurrently
+    // change this thread's state to "shutting down", which we must not
+    // overwrite.
+    int expected = _Py_THREAD_SUSPENDED;
+    (void)_Py_atomic_compare_exchange_int(&owner->state, &expected,
+                                          _Py_THREAD_DETACHED);
+    _PyParkingLot_UnparkAll(&owner->state);
+}
+
 // Enqueue an object to be merged by the owning thread. This steals a
 // reference to the object.
 void
@@ -66,6 +92,36 @@ _Py_brc_queue_object(PyObject *ob)
     struct _brc_bucket *bucket = get_bucket(interp, ob_tid);
     PyMutex_Lock(&bucket->mutex);
     _PyThreadStateImpl *tstate = find_thread_state(bucket, ob_tid);
+
+    if (tstate != NULL && borrow_detached_thread(&tstate->base)) {
+        assert(_PyThreadState_GET() &&
+               _PyThreadState_IsAttached(_PyThreadState_GET()));
+        // This is a very rare race: the GC may run between loading ob_tid
+        // and successfully borrowing the thread, and may have already merged
+        // the refcount (e.g. modified ob->ob_tid). In that case, just decref
+        // and return.
+        if (_Py_atomic_load_uintptr(&ob->ob_tid) != ob_tid) {
+            release_borrowed_thread(&tstate->base);
+            PyMutex_Unlock(&bucket->mutex);
+            Py_DECREF(ob);
+            return;
+        }
+
+        // Now owner thread is stopped and GC can't run, so it's
+        // safe to merge refcount.
+        Py_ssize_t refcount = _Py_ExplicitMergeRefcount(ob, -1);
+
+        release_borrowed_thread(&tstate->base);
+        PyMutex_Unlock(&bucket->mutex);
+
+        // Destructors can run arbitrary code, so run them only after the
+        // borrowed thread and the bucket lock have been released.
+        if (refcount == 0) {
+            _Py_Dealloc(ob);
+        }
+        return;
+    }
+
     if (tstate == NULL) {
         // If we didn't find the owning thread then it must have already exited.
         // It's safe (and necessary) to merge the refcount. Subtract one when
